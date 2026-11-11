@@ -34,7 +34,12 @@ jobs:
           mkdir -p "$HOME/toolchains"
           curl -Lf "https://github.com/ravindu644/Android-Kernel-Tutorials/releases/download/toolchains/clang-r450784e.tar.gz" \
             | tar -xz -C "$HOME/toolchains"
-          "$HOME/toolchains/clang-r450784e/bin/clang" --version | head -2
+          # 自动探测 clang 实际所在目录（压缩包顶层目录名可能带或不带子目录）
+          CLANG_BIN="$(find "$HOME/toolchains" -type f -name clang | head -1)"
+          if [ -z "$CLANG_BIN" ]; then echo "clang not found in toolchains"; exit 1; fi
+          TC_DIR="$(dirname "$(dirname "$CLANG_BIN")")"
+          echo "TOOLCHAIN_DIR=$TC_DIR" >> "$GITHUB_ENV"
+          "$TC_DIR/bin/clang" --version | head -2
 
       - name: Clone kernel/common @ android13-5.15
         run: |
@@ -92,8 +97,8 @@ jobs:
       - name: Build kernel Image
         run: |
           cd kernel
-          export PATH="$HOME/toolchains/clang-r450784e/bin:$PATH"
-          export LD_LIBRARY_PATH="$HOME/toolchains/clang-r450784e/lib:$HOME/toolchains/clang-r450784e/lib64:${LD_LIBRARY_PATH:-}"
+          export PATH="$TOOLCHAIN_DIR/bin:$PATH"
+          export LD_LIBRARY_PATH="$TOOLCHAIN_DIR/lib:$TOOLCHAIN_DIR/lib64:${LD_LIBRARY_PATH:-}"
           set -o pipefail
           make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 HOSTCC=gcc HOSTCXX=g++ -j"$(nproc)" \
             gki_defconfig droidspaces.config 2>&1 | tail -30

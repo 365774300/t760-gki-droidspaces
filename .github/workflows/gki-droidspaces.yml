@@ -46,10 +46,12 @@ jobs:
           COMMIT="${{ github.event.inputs.kernel_commit }}"
           git clone https://android.googlesource.com/kernel/common/ --depth=50 -b android13-5.15 kernel
           cd kernel
-          # 确保编译目标就是设备内核对应的确切 commit
-          git fetch --depth=1 origin "$COMMIT" 2>/dev/null || true
+          # 尽力拉取设备内核对应的确切 commit（android13-5.15 为 KMI 冻结分支，
+          # 即便回退到 tip，符号 CRC 也不会变；刷入前另有 CRC 预检把关）
+          git fetch origin "$COMMIT" --depth=1 2>&1 | head -5 || true
           git checkout -f "$COMMIT" 2>/dev/null || echo "WARN: exact commit not found, using branch tip"
           git log --oneline -1
+          echo "kernelversion: $(make -s kernelversion 2>/dev/null)"
           grep -E "ANDROID_KABI_RESERVE\(8\)" include/linux/sched.h | head -1
 
       - name: Apply Droidspaces SYSVIPC KABI patch (slot 6_7_8)
@@ -100,8 +102,12 @@ jobs:
           export PATH="$TOOLCHAIN_DIR/bin:$PATH"
           export LD_LIBRARY_PATH="$TOOLCHAIN_DIR/lib:$TOOLCHAIN_DIR/lib64:${LD_LIBRARY_PATH:-}"
           set -o pipefail
-          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 HOSTCC=gcc HOSTCXX=g++ -j"$(nproc)" \
-            gki_defconfig droidspaces.config 2>&1 | tail -30
+          # 1) 基础 GKI 配置
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 HOSTCC=gcc HOSTCXX=g++ -j"$(nproc)" gki_defconfig 2>&1 | tail -5
+          # 2) 用官方 merge_config.sh 合并 Droidspaces 配置片段
+          ./scripts/kconfig/merge_config.sh -m out/.config droidspaces.config
+          # 3) olddefconfig 解析依赖
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig 2>&1 | tail -5
           # 打印关键配置确认生效
           for opt in SYSVIPC POSIX_MQUEUE IPC_NS PID_NS USER_NS DEVTMPFS MACVLAN CFS_BANDWIDTH CGROUP_PIDS; do
             printf "%-25s => %s\n" "CONFIG_$opt" "$(grep -E "^CONFIG_${opt}=|^# CONFIG_${opt} is not set" out/.config | head -1)"

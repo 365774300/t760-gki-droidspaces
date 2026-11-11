@@ -1,0 +1,135 @@
+name: Build GKI 5.15 (android13-5.15) Droidspaces kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_commit:
+        description: "kernel/common commit to build (device: be074b05e5af)"
+        required: false
+        default: "be074b05e5af"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Maximize build space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost 2>/dev/null || true
+          sudo docker image prune --all --force 2>/dev/null || true
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bc bison flex pkg-config git curl \
+            tar xz-utils zip unzip cpio rsync kmod perl python3 python-is-python3 \
+            libssl-dev libelf-dev dwarves libncurses-dev zlib1g-dev libyaml-dev \
+            lz4 zstd device-tree-compiler
+
+      - name: Fetch toolchain (clang-r450784e)
+        run: |
+          mkdir -p "$HOME/toolchains"
+          curl -Lf "https://github.com/ravindu644/Android-Kernel-Tutorials/releases/download/toolchains/clang-r450784e.tar.gz" \
+            | tar -xz -C "$HOME/toolchains"
+          "$HOME/toolchains/clang-r450784e/bin/clang" --version | head -2
+
+      - name: Clone kernel/common @ android13-5.15
+        run: |
+          COMMIT="${{ github.event.inputs.kernel_commit }}"
+          git clone https://android.googlesource.com/kernel/common/ --depth=50 -b android13-5.15 kernel
+          cd kernel
+          # 确保编译目标就是设备内核对应的确切 commit
+          git fetch --depth=1 origin "$COMMIT" 2>/dev/null || true
+          git checkout -f "$COMMIT" 2>/dev/null || echo "WARN: exact commit not found, using branch tip"
+          git log --oneline -1
+          grep -E "ANDROID_KABI_RESERVE\(8\)" include/linux/sched.h | head -1
+
+      - name: Apply Droidspaces SYSVIPC KABI patch (slot 6_7_8)
+        run: |
+          cd kernel
+          curl -Lf "https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch" -o /tmp/sysvipc.patch
+          patch -p1 --dry-run < /tmp/sysvipc.patch
+          patch -p1 < /tmp/sysvipc.patch
+          echo "PATCH APPLIED OK"
+
+      - name: Write Droidspaces config fragment
+        run: |
+          cd kernel
+          cat > droidspaces.config << 'EOF'
+          # --- Droidspaces required ---
+          CONFIG_SYSVIPC=y
+          CONFIG_POSIX_MQUEUE=y
+          CONFIG_IPC_NS=y
+          CONFIG_PID_NS=y
+          CONFIG_DEVTMPFS=y
+          CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y
+          # --- Droidspaces recommended (kABI-safe) ---
+          CONFIG_USER_NS=y
+          CONFIG_IP6_NF_NAT=y
+          CONFIG_IP6_NF_TARGET_MASQUERADE=y
+          CONFIG_MACVLAN=y
+          CONFIG_IP_NF_TARGET_REJECT=y
+          CONFIG_IP6_NF_TARGET_REJECT=y
+          CONFIG_NETFILTER_XT_TARGET_LOG=y
+          CONFIG_NETFILTER_XT_MATCH_RECENT=y
+          CONFIG_IP_SET=y
+          CONFIG_IP_SET_HASH_IP=y
+          CONFIG_IP_SET_HASH_NET=y
+          CONFIG_NETFILTER_XT_SET=y
+          CONFIG_TMPFS_POSIX_ACL=y
+          CONFIG_TMPFS_XATTR=y
+          # --- DANGER: keep these OFF (breaks kABI -> bootloop) ---
+          # CONFIG_CFS_BANDWIDTH is not set
+          # CONFIG_CGROUP_PIDS is not set
+          EOF
+          # 去掉 heredoc 缩进
+          sed -i 's/^          //' droidspaces.config
+          cat droidspaces.config
+
+      - name: Build kernel Image
+        run: |
+          cd kernel
+          export PATH="$HOME/toolchains/clang-r450784e/bin:$PATH"
+          export LD_LIBRARY_PATH="$HOME/toolchains/clang-r450784e/lib:$HOME/toolchains/clang-r450784e/lib64:${LD_LIBRARY_PATH:-}"
+          set -o pipefail
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 HOSTCC=gcc HOSTCXX=g++ -j"$(nproc)" \
+            gki_defconfig droidspaces.config 2>&1 | tail -30
+          # 打印关键配置确认生效
+          for opt in SYSVIPC POSIX_MQUEUE IPC_NS PID_NS USER_NS DEVTMPFS MACVLAN CFS_BANDWIDTH CGROUP_PIDS; do
+            printf "%-25s => %s\n" "CONFIG_$opt" "$(grep -E "^CONFIG_${opt}=|^# CONFIG_${opt} is not set" out/.config | head -1)"
+          done
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 HOSTCC=gcc HOSTCXX=g++ -j"$(nproc)" Image 2>&1 | tail -20
+          ls -lh out/arch/arm64/boot/Image
+
+      - name: Collect artifacts
+        run: |
+          cd kernel
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          cp out/arch/arm64/boot/Image "$GITHUB_WORKSPACE/artifacts/Image"
+          cp out/Module.symvers "$GITHUB_WORKSPACE/artifacts/Module.symvers"
+          cp out/.config "$GITHUB_WORKSPACE/artifacts/kernel_config.txt"
+          df -h /
+
+      - name: Upload Image
+        uses: actions/upload-artifact@v4
+        with:
+          name: gki-image-droidspaces
+          path: artifacts/Image
+          if-no-files-found: error
+
+      - name: Upload Module.symvers (for CRC pre-flight check)
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-symvers
+          path: artifacts/Module.symvers
+          if-no-files-found: error
+
+      - name: Upload build config
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-config
+          path: artifacts/kernel_config.txt
+          if-no-files-found: error

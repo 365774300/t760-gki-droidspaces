@@ -104,8 +104,9 @@ jobs:
           set -o pipefail
           # 1) 基础 GKI 配置
           make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 HOSTCC=gcc HOSTCXX=g++ -j"$(nproc)" gki_defconfig 2>&1 | tail -5
-          # 2) 用官方 merge_config.sh 合并 Droidspaces 配置片段
+          # 2) 用官方 merge_config.sh 合并 Droidspaces 配置片段（它会把结果写到 CWD 的 .config）
           ./scripts/kconfig/merge_config.sh -m out/.config droidspaces.config
+          mv -f .config out/.config
           # 3) olddefconfig 解析依赖
           make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig 2>&1 | tail -5
           # 打印关键配置确认生效
